@@ -72,11 +72,11 @@ class TreeManager(_tree_manager_superclass):
     def contribute_to_class(self, model, name):
         super(TreeManager, self).contribute_to_class(model, name)
 
-        if not model._meta.abstract:
+        if not model._meta.abstract and not model._meta.swapped:
             self.tree_model = _get_tree_model(model)
 
             self._base_manager = None
-            if self.tree_model is not model:
+            if self.tree_model and self.tree_model is not model:
                 # _base_manager is the treemanager on tree_model
                 self._base_manager = self.tree_model._tree_manager
 
