@@ -2,17 +2,18 @@ from __future__ import unicode_literals
 from functools import reduce, wraps
 import operator
 import threading
-import django
 
 from django.db import models
 from django.db.models.base import ModelBase
 from django.db.models.query import Q
+from django.db.models.query_utils import DeferredAttribute
 
 from django.utils import six
 from django.utils.translation import ugettext as _
 
 from mptt.fields import TreeForeignKey, TreeOneToOneField, TreeManyToManyField
 from mptt.managers import TreeManager
+from mptt.signals import node_moved
 from mptt.utils import _get_tree_model
 
 
@@ -120,18 +121,28 @@ class MPTTOptions(object):
          - parent pk
          - fields specified in order_insertion_by
 
-        These are used in pre_save to determine if the relevant fields have changed,
+        These are used in save() to determine if the relevant fields have changed,
         so that the MPTT fields need to be updated.
         """
         instance._mptt_cached_fields = {}
         field_names = set((self.parent_attr,))
-        field_names__add = field_names.add
         if self.order_insertion_by:
             for f in self.order_insertion_by:
                 if f[0] == '-':
                     f = f[1:]
-                field_names__add(f)
+                field_names.add(f)
         for field_name in field_names:
+            if instance._deferred:
+                field = instance._meta.get_field(field_name)
+                if field.attname in instance.get_deferred_fields() \
+                        and field.attname not in instance.__dict__:
+                    # deferred attribute (i.e. via .only() or .defer())
+                    # It'd be silly to cache this (that'd do a database query)
+                    # Instead, we mark it as a deferred attribute here, then
+                    # assume it hasn't changed during save(), unless it's no
+                    # longer deferred.
+                    instance._mptt_cached_fields[field_name] = DeferredAttribute
+                    continue
             instance._mptt_cached_fields[field_name] = self.get_raw_field_value(
                 instance, field_name)
 
@@ -223,9 +234,7 @@ class MPTTModelBase(ModelBase):
          - adds a TreeManager to the model
         """
         if class_name == 'NewBase' and class_dict == {}:
-            # skip ModelBase, on django < 1.5 it doesn't handle NewBase.
-            super_new = super(ModelBase, meta).__new__
-            return super_new(meta, class_name, bases, class_dict)
+            return super(MPTTModelBase, meta).__new__(meta, class_name, bases, class_dict)
         is_MPTTModel = False
         try:
             MPTTModel
@@ -336,27 +345,14 @@ class MPTTModelBase(ModelBase):
 
                 # make sure we have a tree manager somewhere
                 tree_manager = None
-                attrs = dir(cls)
-                if "objects" in attrs and isinstance(cls.objects, TreeManager):
-                    tree_manager = cls.objects
-                
-                # Go look for it somewhere else
-                else:
-                    for attr in sorted(attrs):
-                        try:
-                            # HACK: avoid using getattr(cls, attr)
-                            # because it calls __get__ on descriptors, which can cause nasty side effects
-                            # with more inconsiderate apps.
-                            # (e.g. django-tagging's TagField is a descriptor which can do db queries on getattr)
-                            # ( ref: http://stackoverflow.com/questions/27790344 )
-                            obj = cls.__dict__[attr]
-                        except KeyError:
-                            continue
-                        if isinstance(obj, TreeManager):
-                            tree_manager = obj
-                            # prefer any locally defined manager (i.e. keep going if not local)
-                            if obj.model is cls:
-                                break
+                cls_managers = cls._meta.concrete_managers + cls._meta.abstract_managers
+                for __, __, cls_manager in cls_managers:
+                    if isinstance(cls_manager, TreeManager):
+                        # prefer any locally defined manager (i.e. keep going if not local)
+                        if cls_manager.model is cls:
+                            tree_manager = cls_manager
+                            break
+
                 if tree_manager and tree_manager.model is not cls:
                     tree_manager = tree_manager._copy_to_model(cls)
                 elif tree_manager is None:
@@ -708,13 +704,15 @@ class MPTTModel(six.with_metaclass(MPTTModelBase, models.Model)):
         """
         return getattr(self, self._mptt_meta.level_attr)
 
-    def insert_at(self, target, position='first-child', save=False, allow_existing_pk=False, refresh_target=True):
+    def insert_at(self, target, position='first-child', save=False,
+                  allow_existing_pk=False, refresh_target=True):
         """
         Convenience method for calling ``TreeManager.insert_node`` with this
         model instance.
         """
         self._tree_manager.insert_node(
-            self, target, position, save, allow_existing_pk=allow_existing_pk, refresh_target=refresh_target)
+            self, target, position, save, allow_existing_pk=allow_existing_pk,
+            refresh_target=refresh_target)
 
     def is_child_node(self):
         """
@@ -798,10 +796,11 @@ class MPTTModel(six.with_metaclass(MPTTModelBase, models.Model)):
         from django.db.models.fields import AutoField
 
         field_names = []
-        internal_fields = (self._mptt_meta.left_attr, self._mptt_meta.right_attr, self._mptt_meta.tree_id_attr,
-                           self._mptt_meta.level_attr, self._mptt_meta.parent_attr)
+        internal_fields = (
+            self._mptt_meta.left_attr, self._mptt_meta.right_attr, self._mptt_meta.tree_id_attr,
+            self._mptt_meta.level_attr, self._mptt_meta.parent_attr)
         for field in self._meta.fields:
-            if (field.name not in internal_fields) and (not isinstance(field, AutoField)) and (not field.primary_key):
+            if (field.name not in internal_fields) and (not isinstance(field, AutoField)) and (not field.primary_key):  # noqa
                 field_names.append(field.name)
         return field_names
 
@@ -856,14 +855,21 @@ class MPTTModel(six.with_metaclass(MPTTModelBase, models.Model)):
         force_update = kwargs.get('force_update', False)
         force_insert = kwargs.get('force_insert', False)
         collapse_old_tree = None
+        deferred_fields = self.get_deferred_fields()
         if force_update or (not force_insert and self._is_saved(using=kwargs.get('using'))):
             # it already exists, so do a move
             old_parent_id = self._mptt_cached_fields[opts.parent_attr]
-            same_order = old_parent_id == parent_id
+            if old_parent_id is DeferredAttribute:
+                same_order = True
+            else:
+                same_order = old_parent_id == parent_id
+
             if same_order and len(self._mptt_cached_fields) > 1:
-                get_raw_field_value = opts.get_raw_field_value
                 for field_name, old_value in self._mptt_cached_fields.items():
-                    if old_value != get_raw_field_value(self, field_name):
+                    if old_value is DeferredAttribute and field_name not in deferred_fields:
+                        same_order = False
+                        break
+                    if old_value != opts.get_raw_field_value(self, field_name):
                         same_order = False
                         break
                 if not do_updates and not same_order:
@@ -901,7 +907,9 @@ class MPTTModel(six.with_metaclass(MPTTModelBase, models.Model)):
                             or getattr(self, opts.right_attr) > getattr(parent, opts.right_attr))
 
                     if right_sibling:
-                        self._tree_manager._move_node(self, right_sibling, 'left', save=False, refresh_target=False)
+                        self._tree_manager._move_node(
+                            self, right_sibling, 'left', save=False,
+                            refresh_target=False)
                     else:
                         # Default movement
                         if parent_id is None:
@@ -910,7 +918,8 @@ class MPTTModel(six.with_metaclass(MPTTModelBase, models.Model)):
                                 rightmost_sibling = root_nodes.exclude(
                                     pk=self.pk).order_by('-' + opts.tree_id_attr)[0]
                                 self._tree_manager._move_node(
-                                    self, rightmost_sibling, 'right', save=False, refresh_target=False)
+                                    self, rightmost_sibling, 'right', save=False,
+                                    refresh_target=False)
                             except IndexError:
                                 pass
                         else:
@@ -926,15 +935,22 @@ class MPTTModel(six.with_metaclass(MPTTModelBase, models.Model)):
                     # Make sure the new parent is always
                     # restored on the way out in case of errors.
                     opts.set_raw_field_value(self, opts.parent_attr, parent_id)
+
+                # If there were no exceptions raised then send a moved signal
+                node_moved.send(sender=self.__class__, instance=self,
+                                target=getattr(self, opts.parent_attr))
             else:
                 opts.set_raw_field_value(self, opts.parent_attr, parent_id)
-                if (not track_updates) and (django.get_version() >= '1.5'):
+                if not track_updates:
                     # When not using delayed/disabled updates,
-                    # populate update_fields (Django 1.5 and later) with user defined model fields.
-                    # This helps preserve tree integrity when saving model on top of a modified tree.
+                    # populate update_fields with user defined model fields.
+                    # This helps preserve tree integrity when saving model on top
+                    # of a modified tree.
                     if len(args) > 3:
                         if not args[3]:
+                            args = list(args)
                             args[3] = self._get_user_field_names()
+                            args = tuple(args)
                     else:
                         if not kwargs.get("update_fields", None):
                             kwargs["update_fields"] = self._get_user_field_names()
@@ -958,7 +974,8 @@ class MPTTModel(six.with_metaclass(MPTTModelBase, models.Model)):
                         right_sibling = opts.get_ordered_insertion_target(self, parent)
 
                 if right_sibling:
-                    self.insert_at(right_sibling, 'left', allow_existing_pk=True, refresh_target=False)
+                    self.insert_at(right_sibling, 'left', allow_existing_pk=True,
+                                   refresh_target=False)
 
                     if parent:
                         # since we didn't insert into parent, we have to update parent.rght

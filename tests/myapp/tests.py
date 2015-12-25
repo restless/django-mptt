@@ -5,26 +5,22 @@ import os
 import re
 import sys
 import tempfile
+import unittest
 
-if sys.version_info < (2, 7):
-    # we need unittest.skipIf, which isn't in unittest in python 2.6.
-    # note this causes a deprecation warning on django 1.7, but django 1.7 doesn't support python < 2.7
-    from django.utils import unittest
-else:
-    import unittest
-
-import django
 from django.contrib.auth.models import Group, User
-from django.db.models import Q, Manager
-try:
-    from django.apps import apps
-    get_models = apps.get_models
-except ImportError:  # pragma: no cover (Django 1.6 compatibility)
-    from django.db.models import get_models
+from django.db.models import Q
+from django.db.models.query_utils import DeferredAttribute
+from django.apps import apps
 from django.forms.models import modelform_factory
 from django.template import Template, TemplateSyntaxError, Context
 from django.test import TestCase
 from django.utils.six import string_types, PY3, b, assertRaisesRegex
+
+try:
+    from mock_django import mock_signal_receiver
+except ImportError:
+    mock_signal_receiver = None
+
 
 from mptt.exceptions import CantDisableUpdates, InvalidMove
 from mptt.forms import (
@@ -32,6 +28,7 @@ from mptt.forms import (
     MoveNodeForm)
 from mptt.models import MPTTModel
 from mptt.managers import TreeManager
+from mptt.signals import node_moved
 from mptt.templatetags.mptt_tags import cache_tree_children
 from mptt.utils import print_debug_info
 
@@ -39,13 +36,6 @@ from myapp.models import (
     Category, Item, Genre, CustomPKName, SingleProxyModel, DoubleProxyModel,
     ConcreteModel, OrderedInsertion, AutoNowDateFieldModel, Person,
     CustomTreeQueryset, Node, ReferencingModel, CustomTreeManager)
-
-
-extra_queries_per_update = 0
-if django.VERSION < (1, 6):
-    # before django 1.6, Model.save() did a select then an update/insert.
-    # now, Model.save() does an update followed an insert if the update changed 0 rows.
-    extra_queries_per_update = 1
 
 
 def get_tree_details(nodes):
@@ -114,6 +104,8 @@ class DocTestTestCase(TreeTestCase):
                     # workarounds :(
                     text = re.sub(r"""\bu(["\'])""", r"\1", text)
                     temp.write(b(text))
+                else:
+                    temp.write(text)
 
                 temp.flush()
 
@@ -324,7 +316,6 @@ class ReparentingTestCase(TreeTestCase):
         self.assertEqual(platformer.parent, platformer_4d)
 
 
-@unittest.skipIf(django.VERSION < (1, 5), 'Django 1.4 and earlier does not support update_fields in model save() method')
 class ConcurrencyTestCase(TreeTestCase):
     """
     Test that tree structure remains intact when saving nodes (without setting new parent) after
@@ -365,7 +356,6 @@ class ConcurrencyTestCase(TreeTestCase):
             4 1 1 1 10 11
         """)
 
-
     def test_node_save_after_tree_restructuring(self):
         carrot = ConcreteModel.objects.get(id=6)
 
@@ -378,7 +368,7 @@ class ConcurrencyTestCase(TreeTestCase):
 
     def test_node_save_after_tree_restructuring_with_update_fields(self):
         """
-        Test that model is saved properly when passing update_fields as keyword or positional argument.
+        Test that model is saved properly when passing update_fields
         """
         carrot = ConcreteModel.objects.get(id=6)
 
@@ -404,6 +394,18 @@ class ConcurrencyTestCase(TreeTestCase):
         updated_carrot = ConcreteModel.objects.get(id=6)
         self.assertNotEqual(updated_carrot.ghosts, carrot.ghosts)
         self.assertEqual(updated_carrot.name, carrot.name)
+
+    def test_update_fields_positional(self):
+        """
+        Test that update_fields works as a positional argument
+
+        Test for https://github.com/django-mptt/django-mptt/issues/384
+        """
+
+        carrot = ConcreteModel.objects.get(id=6)
+
+        # Why would you do it this way? Meh.
+        carrot.save(False, False, None, None)
 
 
 # categories.json defines the following tree structure:
@@ -648,9 +650,9 @@ class DisabledUpdatesTestCase(TreeTestCase):
         """)
 
     def test_move_node_same_tree(self):
-        with self.assertNumQueries(2 + extra_queries_per_update):
+        with self.assertNumQueries(2):
             with ConcreteModel.objects.disable_mptt_updates():
-                with self.assertNumQueries(1 + extra_queries_per_update):
+                with self.assertNumQueries(1):
                     # 2 queries here:
                     #  (django does a query to determine if the row is in the db yet)
                     self.c.parent = self.b
@@ -672,9 +674,9 @@ class DisabledUpdatesTestCase(TreeTestCase):
         """)
 
     def test_move_node_different_tree(self):
-        with self.assertNumQueries(2 + extra_queries_per_update):
+        with self.assertNumQueries(2):
             with ConcreteModel.objects.disable_mptt_updates():
-                with self.assertNumQueries(1 + extra_queries_per_update):
+                with self.assertNumQueries(1):
                     # 1 update query
                     self.c.parent = self.d
                     self.c.save()
@@ -695,9 +697,9 @@ class DisabledUpdatesTestCase(TreeTestCase):
         """)
 
     def test_move_node_to_root(self):
-        with self.assertNumQueries(2 + extra_queries_per_update):
+        with self.assertNumQueries(2):
             with ConcreteModel.objects.disable_mptt_updates():
-                with self.assertNumQueries(1 + extra_queries_per_update):
+                with self.assertNumQueries(1):
                     # 1 update query
                     self.c.parent = None
                     self.c.save()
@@ -718,9 +720,9 @@ class DisabledUpdatesTestCase(TreeTestCase):
         """)
 
     def test_move_root_to_child(self):
-        with self.assertNumQueries(2 + extra_queries_per_update):
+        with self.assertNumQueries(2):
             with ConcreteModel.objects.disable_mptt_updates():
-                with self.assertNumQueries(1 + extra_queries_per_update):
+                with self.assertNumQueries(1):
                     # 1 update query
                     self.d.parent = self.c
                     self.d.save()
@@ -838,9 +840,9 @@ class DelayedUpdatesTestCase(TreeTestCase):
         """)
 
     def test_move_node_same_tree(self):
-        with self.assertNumQueries(10 + extra_queries_per_update):
+        with self.assertNumQueries(10):
             with ConcreteModel.objects.delay_mptt_updates():
-                with self.assertNumQueries(2 + extra_queries_per_update):
+                with self.assertNumQueries(2):
                     # 1 query to ensure target fields aren't stale
                     # 1 update query
                     self.c.parent = self.b
@@ -864,9 +866,9 @@ class DelayedUpdatesTestCase(TreeTestCase):
         """)
 
     def test_move_node_different_tree(self):
-        with self.assertNumQueries(12 + extra_queries_per_update):
+        with self.assertNumQueries(12):
             with ConcreteModel.objects.delay_mptt_updates():
-                with self.assertNumQueries(2 + extra_queries_per_update):
+                with self.assertNumQueries(2):
                     # 2 queries here:
                     #  1. update the node
                     #  2. collapse old tree since it is now empty.
@@ -891,9 +893,9 @@ class DelayedUpdatesTestCase(TreeTestCase):
         """)
 
     def test_move_node_to_root(self):
-        with self.assertNumQueries(4 + extra_queries_per_update):
+        with self.assertNumQueries(4):
             with ConcreteModel.objects.delay_mptt_updates():
-                with self.assertNumQueries(3 + extra_queries_per_update):
+                with self.assertNumQueries(3):
                     # 3 queries here!
                     #   1. find the next tree_id to move to
                     #   2. update the tree_id on all nodes to the right of that
@@ -918,9 +920,9 @@ class DelayedUpdatesTestCase(TreeTestCase):
         """)
 
     def test_move_root_to_child(self):
-        with self.assertNumQueries(12 + extra_queries_per_update):
+        with self.assertNumQueries(12):
             with ConcreteModel.objects.delay_mptt_updates():
-                with self.assertNumQueries(2 + extra_queries_per_update):
+                with self.assertNumQueries(2):
                     # 2 queries here:
                     #  1. update the node
                     #  2. collapse old tree since it is now empty.
@@ -1017,9 +1019,9 @@ class OrderedInsertionDelayedUpdatesTestCase(TreeTestCase):
         """)
 
     def test_move_node_same_tree(self):
-        with self.assertNumQueries(9 + extra_queries_per_update):
+        with self.assertNumQueries(9):
             with OrderedInsertion.objects.delay_mptt_updates():
-                with self.assertNumQueries(1 + extra_queries_per_update):
+                with self.assertNumQueries(1):
                     # 1 update query
                     self.e.name = 'before d'
                     self.e.save()
@@ -1042,9 +1044,9 @@ class OrderedInsertionDelayedUpdatesTestCase(TreeTestCase):
         """)
 
     def test_move_node_different_tree(self):
-        with self.assertNumQueries(12 + extra_queries_per_update):
+        with self.assertNumQueries(12):
             with OrderedInsertion.objects.delay_mptt_updates():
-                with self.assertNumQueries(2 + extra_queries_per_update):
+                with self.assertNumQueries(2):
                     # 2 queries here:
                     #  1. update the node
                     #  2. collapse old tree since it is now empty.
@@ -1070,9 +1072,9 @@ class OrderedInsertionDelayedUpdatesTestCase(TreeTestCase):
         """)
 
     def test_move_node_to_root(self):
-        with self.assertNumQueries(4 + extra_queries_per_update):
+        with self.assertNumQueries(4):
             with OrderedInsertion.objects.delay_mptt_updates():
-                with self.assertNumQueries(3 + extra_queries_per_update):
+                with self.assertNumQueries(3):
                     # 3 queries here!
                     #   1. find the next tree_id to move to
                     #   2. update the tree_id on all nodes to the right of that
@@ -1097,9 +1099,9 @@ class OrderedInsertionDelayedUpdatesTestCase(TreeTestCase):
         """)
 
     def test_move_root_to_child(self):
-        with self.assertNumQueries(12 + extra_queries_per_update):
+        with self.assertNumQueries(12):
             with OrderedInsertion.objects.delay_mptt_updates():
-                with self.assertNumQueries(2 + extra_queries_per_update):
+                with self.assertNumQueries(2):
                     # 2 queries here:
                     #  1. update the node
                     #  2. collapse old tree since it is now empty.
@@ -1132,7 +1134,7 @@ class ManagerTests(TreeTestCase):
     def test_all_managers_are_different(self):
         # all tree managers should be different. otherwise, possible infinite recursion.
         seen = {}
-        for model in get_models():
+        for model in apps.get_models():
             if not issubclass(model, MPTTModel):
                 continue
             tm = model._tree_manager
@@ -1144,14 +1146,14 @@ class ManagerTests(TreeTestCase):
 
     def test_all_managers_have_correct_model(self):
         # all tree managers should have the correct model.
-        for model in get_models():
+        for model in apps.get_models():
             if not issubclass(model, MPTTModel):
                 continue
             self.assertEqual(model._tree_manager.model, model)
 
     def test_base_manager_infinite_recursion(self):
         # repeatedly calling _base_manager should eventually return None
-        for model in get_models():
+        for model in apps.get_models():
             if not issubclass(model, MPTTModel):
                 continue
             manager = model._tree_manager
@@ -1175,7 +1177,7 @@ class ManagerTests(TreeTestCase):
                 qs, include_self=include_self)
             return list(desc.values_list('name', flat=True).order_by('name'))
 
-        qs = Category.objects.filter(Q(name='Nintendo Wii')|Q(name='PlayStation 3'))
+        qs = Category.objects.filter(Q(name='Nintendo Wii') | Q(name='PlayStation 3'))
 
         self.assertEqual(
             get_desc_names(qs),
@@ -1212,11 +1214,11 @@ class ManagerTests(TreeTestCase):
         return list(anc.values_list('name', flat=True).order_by('name'))
 
     def test_get_queryset_ancestors(self):
-        qs = Category.objects.filter(Q(name='Nintendo Wii')|Q(name='PlayStation 3'))
+        qs = Category.objects.filter(Q(name='Nintendo Wii') | Q(name='PlayStation 3'))
 
         self.assertEqual(
             self._get_anc_names(qs),
-             ['PC & Video Games']
+            ['PC & Video Games']
         )
 
         self.assertEqual(
@@ -1225,13 +1227,17 @@ class ManagerTests(TreeTestCase):
         )
 
         qs = Genre.objects.filter(parent=None)
-        self.assertEqual(self._get_anc_names(qs),[])
-        self.assertEqual(self._get_anc_names(qs, include_self=True), ['Action', 'Role-playing Game'])
+        self.assertEqual(self._get_anc_names(qs), [])
+        self.assertEqual(
+            self._get_anc_names(qs, include_self=True),
+            ['Action', 'Role-playing Game'])
 
     def test_get_queryset_ancestors_regression_379(self):
         # https://github.com/django-mptt/django-mptt/issues/379
         qs = Genre.objects.all()
-        self.assertEqual(self._get_anc_names(qs, include_self=True), list(Genre.objects.values_list('name', flat=True).order_by('name')))
+        self.assertEqual(
+            self._get_anc_names(qs, include_self=True),
+            list(Genre.objects.values_list('name', flat=True).order_by('name')))
 
     def test_custom_querysets(self):
         """
@@ -1242,17 +1248,14 @@ class ManagerTests(TreeTestCase):
         self.assertTrue(isinstance(Person.objects.all()[0].get_children(), CustomTreeQueryset))
         self.assertTrue(hasattr(Person.objects.none(), 'custom_method'))
 
-        # In Django 1.4, we would have had a custom type CustomEmptyTreeQueryset
-        # but this was abandoned in later versions. However, the best method is
-        # to just test if the custom method is available.
-        # self.assertTrue(hasattr(Person.objects.all()[0].get_children().none(), 'custom_method'))
+        # Check that empty querysets get custom methods
+        self.assertTrue(hasattr(Person.objects.all()[0].get_children().none(), 'custom_method'))
 
         self.assertEqual(
             type(Person.objects.all()),
             type(Person.objects.root_nodes())
         )
 
-    @unittest.skipIf(django.VERSION < (1, 7), 'Django 1.6 and earlier does not provide Manager.from_queryset')
     def test_manager_from_custom_queryset(self):
         """
         Test that a manager created from a custom queryset works.
@@ -1261,6 +1264,18 @@ class ManagerTests(TreeTestCase):
         TreeManager.from_queryset(CustomTreeQueryset)().contribute_to_class(Genre, 'my_manager')
 
         self.assertIsInstance(Genre.my_manager.get_queryset(), CustomTreeQueryset)
+
+    def test_num_queries_on_get_queryset_descendants(self):
+        """
+        Test the number of queries to access descendants
+        is not O(n).
+        At the moment it is O(1)+1.
+        Ideally we should aim for O(1).
+        """
+        with self.assertNumQueries(2):
+            qs = Category.objects.get_queryset_descendants(
+                Category.objects.all(), include_self=True)
+            self.assertEqual(len(qs), 10)
 
 
 class CacheTreeChildrenTestCase(TreeTestCase):
@@ -1291,14 +1306,16 @@ class CacheTreeChildrenTestCase(TreeTestCase):
         """
 
         with self.assertNumQueries(1):
-            self.assertRaises(
-                ValueError,
-                cache_tree_children,
-                list(Category.objects.order_by('-id')))
+            with self.assertRaises(ValueError):
+                cache_tree_children(list(Category.objects.order_by('-id')))
 
         # Passing a list with correct ordering should work, though.
         with self.assertNumQueries(1):
             cache_tree_children(list(Category.objects.all()))
+
+        # The exact ordering tuple doesn't matter, long as the nodes end up in depth-first order.
+        cache_tree_children(Category.objects.order_by('tree_id', 'lft', 'name'))
+        cache_tree_children(Category.objects.filter(tree_id=1).order_by('lft'))
 
 
 class RecurseTreeTestCase(TreeTestCase):
@@ -1682,22 +1699,38 @@ class QuerySetTests(TreeTestCase):
 
     def test_get_ancestors(self):
         self.assertEqual(
-            [c.pk for c in Category.objects.get(name="Nintendo Wii").get_ancestors(include_self=False)],
-            [c.pk for c in Category.objects.filter(name="Nintendo Wii").get_ancestors(include_self=False)],
+            [
+                c.pk for c in
+                Category.objects.get(name="Nintendo Wii").get_ancestors(include_self=False)],
+            [
+                c.pk for c in
+                Category.objects.filter(name="Nintendo Wii").get_ancestors(include_self=False)],
         )
         self.assertEqual(
-            [c.pk for c in Category.objects.get(name="Nintendo Wii").get_ancestors(include_self=True)],
-            [c.pk for c in Category.objects.filter(name="Nintendo Wii").get_ancestors(include_self=True)],
+            [
+                c.pk for c in
+                Category.objects.get(name="Nintendo Wii").get_ancestors(include_self=True)],
+            [
+                c.pk for c in
+                Category.objects.filter(name="Nintendo Wii").get_ancestors(include_self=True)],
         )
 
     def test_get_descendants(self):
         self.assertEqual(
-            [c.pk for c in Category.objects.get(name="Nintendo Wii").get_descendants(include_self=False)],
-            [c.pk for c in Category.objects.filter(name="Nintendo Wii").get_descendants(include_self=False)],
+            [
+                c.pk for c in
+                Category.objects.get(name="Nintendo Wii").get_descendants(include_self=False)],
+            [
+                c.pk for c in
+                Category.objects.filter(name="Nintendo Wii").get_descendants(include_self=False)],
         )
         self.assertEqual(
-            [c.pk for c in Category.objects.get(name="Nintendo Wii").get_descendants(include_self=True)],
-            [c.pk for c in Category.objects.filter(name="Nintendo Wii").get_descendants(include_self=True)],
+            [
+                c.pk for c in
+                Category.objects.get(name="Nintendo Wii").get_descendants(include_self=True)],
+            [
+                c.pk for c in
+                Category.objects.filter(name="Nintendo Wii").get_descendants(include_self=True)],
         )
 
 
@@ -1773,7 +1806,6 @@ class TestOrderedInsertionBFS(TreeTestCase):
             3 2 1 2 5 6
         """)
 
-
     def test_insert_ordered_BFS_backwards_nonroot_nodes(self):
         music = OrderedInsertion.objects.create(name='music')
         rock = OrderedInsertion.objects.create(name="Rock", parent=music)
@@ -1793,3 +1825,123 @@ class TestOrderedInsertionBFS(TreeTestCase):
             2 1 1 1 4 7
             4 2 1 2 5 6
         """)
+
+
+class CacheChildrenTestCase(TreeTestCase):
+    """
+    Tests that the queryset function `get_cached_trees` results in a minimum
+    number of database queries.
+    """
+    fixtures = ['genres.json']
+
+    def test_genre_iter(self):
+        """
+        Test a query with two root nodes.
+        """
+        with self.assertNumQueries(1):
+            root_nodes = Genre.objects.all().get_cached_trees()
+
+        # `get_cached_trees` should only return the root nodes
+        self.assertEqual(len(root_nodes), 2)
+
+        # Getting the children of each node should not result in db hits.
+        with self.assertNumQueries(0):
+            for genre in root_nodes:
+                self.assertIsInstance(genre, Genre)
+                for child in genre.get_children():
+                    self.assertIsInstance(child, Genre)
+                    for child2 in child.get_children():
+                        self.assertIsInstance(child2, Genre)
+
+
+@unittest.skipUnless(mock_signal_receiver, "Signals tests require mock_django installed")
+class Signals(TestCase):
+    fixtures = ['categories.json']
+
+    def setUp(self):
+        self.signal = node_moved
+        self.wii = Category.objects.get(pk=2)
+        self.ps3 = Category.objects.get(pk=8)
+
+    def test_signal_should_not_be_sent_when_parent_hasnt_changed(self):
+        with mock_signal_receiver(self.signal, sender=Category) as receiver:
+            self.wii.name = 'Woo'
+            self.wii.save()
+
+            self.assertEqual(receiver.call_count, 0)
+
+    def test_signal_should_not_be_sent_when_model_created(self):
+        with mock_signal_receiver(self.signal, sender=Category) as receiver:
+            Category.objects.create(name='Descriptive name')
+
+            self.assertEqual(receiver.call_count, 0)
+
+    def test_move_by_using_move_to_should_send_signal(self):
+        with mock_signal_receiver(self.signal, sender=Category) as receiver:
+            self.wii.move_to(self.ps3)
+
+            receiver.assert_called_once_with(
+                instance=self.wii,
+                signal=self.signal,
+                target=self.ps3,
+                sender=Category,
+                position='first-child'
+            )
+
+    def test_move_by_changing_parent_should_send_signal(self):
+        '''position is not set when sent from save(). I assume it
+        would be the default(first-child) but didn't feel comfortable
+        setting it.
+        '''
+        with mock_signal_receiver(self.signal, sender=Category) as receiver:
+            self.wii.parent = self.ps3
+            self.wii.save()
+
+            receiver.assert_called_once_with(
+                instance=self.wii,
+                signal=self.signal,
+                target=self.ps3,
+                sender=Category
+            )
+
+
+class DeferredAttributeTests(TreeTestCase):
+    """
+    Regression tests for #176 and #424
+    """
+    def setUp(self):
+        OrderedInsertion.objects.create(name="a")
+
+    def test_deferred_order_insertion_by(self):
+        qs = OrderedInsertion.objects.defer('name')
+        with self.assertNumQueries(1):
+            nodes = list(qs)
+        with self.assertNumQueries(0):
+            self.assertTreeEqual(nodes, '''
+                1 - 1 0 1 2
+            ''')
+
+    def test_deferred_cached_field_undeferred(self):
+        obj = OrderedInsertion.objects.defer('name').get()
+        self.assertEqual(obj._mptt_cached_fields['name'], DeferredAttribute)
+
+        with self.assertNumQueries(1):
+            obj.name
+        with self.assertNumQueries(3):
+            # does a node move, since the order_insertion_by field changed
+            obj.save()
+
+        self.assertEqual(obj._mptt_cached_fields['name'], 'a')
+
+    def test_deferred_cached_field_change(self):
+        obj = OrderedInsertion.objects.defer('name').get()
+        self.assertEqual(obj._mptt_cached_fields['name'], DeferredAttribute)
+
+        with self.assertNumQueries(0):
+            obj.name = 'b'
+
+        with self.assertNumQueries(3):
+            # does a node move, since the order_insertion_by field changed
+            obj.save()
+
+        self.assertEqual(obj._mptt_cached_fields['name'], 'b')

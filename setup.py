@@ -3,7 +3,7 @@ from __future__ import unicode_literals
 
 from mptt import VERSION
 
-requires = (str('Django>=1.4.2'),)
+requires = (str('Django>=1.8'),)
 try:
     from setuptools import setup
     kwargs = {str('install_requires'): requires}
@@ -27,6 +27,7 @@ setup(
     author_email=str('craig.ds@gmail.com'),
     url=str('http://github.com/django-mptt/django-mptt'),
     packages=[str('mptt'), str('mptt.templatetags')],
+    test_requires=('mock-django>=0.6.7',),
     package_data={str('mptt'): [str('templates/admin/*'), str('locale/*/*/*.*')]},
     classifiers=[
         str('Development Status :: 4 - Beta'),
@@ -37,7 +38,6 @@ setup(
         str('Operating System :: OS Independent'),
         str('Programming Language :: Python'),
         str("Programming Language :: Python :: 2"),
-        str("Programming Language :: Python :: 2.6"),
         str("Programming Language :: Python :: 2.7"),
         str("Programming Language :: Python :: 3"),
         str("Programming Language :: Python :: 3.2"),

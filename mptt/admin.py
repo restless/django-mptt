@@ -1,13 +1,9 @@
 from __future__ import unicode_literals
 
-import django
 from django.conf import settings
 from django.contrib.admin.actions import delete_selected
 from django.contrib.admin.options import ModelAdmin
-try:
-    from django.utils.encoding import force_text
-except ImportError:  # pragma: no cover (Django 1.4 compatibility)
-    from django.utils.encoding import force_unicode as force_text
+from django.utils.encoding import force_text
 from django.utils.translation import ugettext as _
 
 from mptt.forms import MPTTAdminForm, TreeNodeChoiceField
@@ -37,16 +33,11 @@ class MPTTModelAdmin(ModelAdmin):
                 and db_field.name not in self.raw_id_fields:
             db = kwargs.get('using')
 
-            if django.VERSION >= (1, 7):
-                # This resolves callable values for db_field.rel.limit_choices_to,
-                # but isn't available/required on django < 1.7
-                limit_choices_to = db_field.get_limit_choices_to()
-            else:
-                limit_choices_to = db_field.rel.limit_choices_to
-
+            limit_choices_to = db_field.get_limit_choices_to()
             defaults = dict(
                 form_class=TreeNodeChoiceField,
-                queryset=db_field.rel.to._default_manager.using(db).complex_filter(limit_choices_to),
+                queryset=db_field.rel.to._default_manager.using(
+                    db).complex_filter(limit_choices_to),
                 required=False)
             defaults.update(kwargs)
             kwargs = defaults
@@ -69,7 +60,7 @@ class MPTTModelAdmin(ModelAdmin):
         # If this is True, the confirmation page has been displayed
         if request.POST.get('post'):
             n = 0
-            with queryset.model.objects.delay_mptt_updates():
+            with queryset.model._tree_manager.delay_mptt_updates():
                 for obj in queryset:
                     if self.has_delete_permission(request, obj):
                         obj.delete()

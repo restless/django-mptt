@@ -13,12 +13,8 @@ from django.utils.translation import ugettext as _
 from mptt.exceptions import CantDisableUpdates, InvalidMove
 from mptt.querysets import TreeQuerySet
 from mptt.utils import _get_tree_model
+from mptt.signals import node_moved
 
-if django.VERSION < (1, 7):
-    _tree_manager_superclass = models.Manager
-else:
-    # Django 1.7+ added this crazy new pattern for manager inheritance.
-    _tree_manager_superclass = models.Manager.from_queryset(TreeQuerySet)
 
 __all__ = ('TreeManager',)
 
@@ -64,7 +60,7 @@ CUMULATIVE_COUNT_SUBQUERY_M2M = """(
 )"""
 
 
-class TreeManager(_tree_manager_superclass):
+class TreeManager(models.Manager.from_queryset(TreeQuerySet)):
     """
     A manager for working with trees of objects.
     """
@@ -79,14 +75,6 @@ class TreeManager(_tree_manager_superclass):
             if self.tree_model and self.tree_model is not model:
                 # _base_manager is the treemanager on tree_model
                 self._base_manager = self.tree_model._tree_manager
-
-    def get_query_set(self, *args, **kwargs):
-        """
-        Ensures that this manager always returns nodes in tree order.
-
-        This method can be removed when support for Django < 1.6 is dropped.
-        """
-        return TreeQuerySet(self.model, using=self._db).order_by(self.tree_id_attr, self.left_attr)
 
     def get_queryset(self, *args, **kwargs):
         """
@@ -139,9 +127,6 @@ class TreeManager(_tree_manager_superclass):
 
         opts = queryset.model._mptt_meta
 
-        if not queryset:
-            return self.none()
-
         filters = Q()
 
         e = 'e' if include_self else ''
@@ -158,9 +143,26 @@ class TreeManager(_tree_manager_superclass):
         min_key = '%s__%s' % (min_attr, min_op)
         max_key = '%s__%s' % (max_attr, max_op)
 
-        q = queryset.order_by(opts.tree_id_attr, opts.parent_attr, opts.left_attr)
+        q = queryset.order_by(opts.tree_id_attr, opts.parent_attr, opts.left_attr).only(
+            opts.tree_id_attr,
+            opts.left_attr,
+            opts.right_attr,
+            min_attr,
+            max_attr,
+            opts.parent_attr,
+            # These fields are used by MPTTModel.update_mptt_cached_fields()
+            *opts.order_insertion_by
+        )
 
-        for group in groupby(q, key = lambda n: (getattr(n, opts.tree_id_attr), getattr(n, opts.parent_attr))):
+        if not q:
+            return self.none()
+
+        for group in groupby(
+                q,
+                key=lambda n: (
+                    getattr(n, opts.tree_id_attr),
+                    getattr(n, opts.parent_attr + '_id'),
+                )):
             next_lft = None
             for node in list(group[1]):
                 tree, lft, rght, min_val, max_val = (getattr(node, opts.tree_id_attr),
@@ -170,7 +172,7 @@ class TreeManager(_tree_manager_superclass):
                                                      getattr(node, max_attr))
                 if next_lft is None:
                     next_lft = rght + 1
-                    min_max = {'min': min_val, 'max': max_val} 
+                    min_max = {'min': min_val, 'max': max_val}
                 elif lft == next_lft:
                     if min_val < min_max['min']:
                         min_max['min'] = min_val
@@ -178,10 +180,18 @@ class TreeManager(_tree_manager_superclass):
                         min_max['max'] = max_val
                     next_lft = rght + 1
                 elif lft != next_lft:
-                    filters |= Q(**{tree_key: tree, min_key: min_max['min'], max_key: min_max['max']})
+                    filters |= Q(**{
+                        tree_key: tree,
+                        min_key: min_max['min'],
+                        max_key: min_max['max'],
+                    })
                     min_max = {'min': min_val, 'max': max_val}
                     next_lft = rght + 1
-            filters |= Q(**{tree_key: tree, min_key: min_max['min'], max_key: min_max['max']})
+            filters |= Q(**{
+                tree_key: tree,
+                min_key: min_max['min'],
+                max_key: min_max['max'],
+            })
 
         return self.filter(filters)
 
@@ -559,7 +569,8 @@ class TreeManager(_tree_manager_superclass):
 
     def _move_node(self, node, target, position='last-child', save=True, refresh_target=True):
         if self._base_manager:
-            return self._base_manager.move_node(node, target, position=position)
+            return self._base_manager._move_node(node, target, position=position,
+                                                 save=save, refresh_target=refresh_target)
 
         if self.tree_model._mptt_is_tracking:
             # delegate to insert_node and clean up the gaps later.
@@ -601,6 +612,8 @@ class TreeManager(_tree_manager_superclass):
         move the node yourself by setting node.parent.
         """
         self._move_node(node, target, position=position)
+        node_moved.send(sender=node.__class__, instance=node,
+                        target=target, position=position)
 
     def root_node(self, tree_id):
         """

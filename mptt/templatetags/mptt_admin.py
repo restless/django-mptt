@@ -3,21 +3,14 @@ from __future__ import unicode_literals
 from django.conf import settings
 from django.contrib.admin.templatetags.admin_list import (
     result_hidden_fields, _boolean_icon, result_headers)
-try:
-    from django.contrib.admin.utils import lookup_field, display_for_field
-except ImportError:  # pragma: no cover (Django 1.6 compatibility)
-    from django.contrib.admin.util import lookup_field, display_for_field
-from django.contrib.admin.views.main import EMPTY_CHANGELIST_VALUE
+from django.contrib.admin.utils import lookup_field, display_for_field
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import models
 from django.template import Library
+from django.utils.encoding import smart_text, force_text
 from django.utils.html import escape, conditional_escape
 from django.utils.safestring import mark_safe
 from django.utils.translation import get_language_bidi
-try:
-    from django.utils.encoding import smart_text, force_text
-except ImportError:  # pragma: no cover (Django 1.4 compatibility)
-    from django.utils.encoding import smart_unicode as smart_text, force_unicode as force_text
 
 
 register = Library()
@@ -25,6 +18,15 @@ register = Library()
 
 MPTT_ADMIN_LEVEL_INDENT = getattr(settings, 'MPTT_ADMIN_LEVEL_INDENT', 10)
 IS_GRAPPELLI_INSTALLED = True if 'grappelli' in settings.INSTALLED_APPS else False
+
+
+def get_empty_value_display(cl):
+    if hasattr(cl.model_admin, 'get_empty_value_display'):
+        return cl.model_admin.get_empty_value_display()
+    else:
+        # Django < 1.9
+        from django.contrib.admin.views.main import EMPTY_CHANGELIST_VALUE
+        return EMPTY_CHANGELIST_VALUE
 
 
 ###
@@ -62,7 +64,7 @@ def mptt_items_for_result(cl, result, form):
         try:
             f, attr, value = lookup_field(field_name, result, cl.model_admin)
         except (AttributeError, ObjectDoesNotExist):
-            result_repr = EMPTY_CHANGELIST_VALUE
+            result_repr = get_empty_value_display(cl)
         else:
             if f is None:
                 if field_name == 'action_checkbox':
@@ -77,18 +79,24 @@ def mptt_items_for_result(cl, result, form):
                 # Strip HTML tags in the resulting text, except if the
                 # function has an "allow_tags" attribute set to True.
                 if not allow_tags:
-                    result_repr = escape(result_repr)
+                    result_repr = conditional_escape(result_repr)
                 else:
                     result_repr = mark_safe(result_repr)
             else:
                 if isinstance(f.rel, models.ManyToOneRel):
                     field_val = getattr(result, f.name)
                     if field_val is None:
-                        result_repr = EMPTY_CHANGELIST_VALUE
+                        result_repr = get_empty_value_display(cl)
                     else:
                         result_repr = escape(field_val)
                 else:
-                    result_repr = display_for_field(value, f)
+                    try:
+                        result_repr = display_for_field(value, f)
+                    except TypeError:
+                        # Changed in Django 1.9, now takes 3 arguments
+                        result_repr = display_for_field(
+                            value, f, get_empty_value_display(cl))
+
                 if isinstance(f, models.DateField)\
                         or isinstance(f, models.TimeField)\
                         or isinstance(f, models.ForeignKey):
